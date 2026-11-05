@@ -1,0 +1,32 @@
+import { TypedEmitter } from "../events.js";
+import type { GatewayPayload } from "../types.js";
+
+interface GatewayEvents { ready: unknown; dispatch: {t:string;d:unknown;s:number|null}; close: {code:number;reason:string}; error: Error; reconnecting: {attempt:number;delay:number}; heartbeat: {latency:number|null} }
+const OP = { DISPATCH:0, HEARTBEAT:1, IDENTIFY:2, PRESENCE:3, VOICE_STATE:4, RESUME:6, RECONNECT:7, REQUEST_MEMBERS:8, INVALID_SESSION:9, HELLO:10, HEARTBEAT_ACK:11 } as const;
+export interface GatewayOptions { token:string; intents:number; url?:string; reconnect?:boolean; properties?:{os?:string;browser?:string;device?:string} }
+export class Gateway extends TypedEmitter<GatewayEvents> {
+  private socket: WebSocket | undefined; private sequence:number|null=null; private sessionId: string | undefined; private resumeUrl: string | undefined; private heartbeatInterval: ReturnType<typeof setInterval> | undefined; private heartbeatInitial: ReturnType<typeof setTimeout> | undefined; private heartbeatTimeout: ReturnType<typeof setTimeout> | undefined; private reconnectTimer: ReturnType<typeof setTimeout> | undefined; private heartbeatAck=true; private lastHeartbeat=0; private attempts=0; private heartbeatIntervalMs=45_000; private destroyed=false; private connecting=false;
+  constructor(private readonly options:GatewayOptions){super();}
+  connect():void { if(this.destroyed) throw new Error("Gateway has been destroyed"); if(this.connecting || this.socket?.readyState===WebSocket.OPEN) return; this.connecting=true; const base=this.resumeUrl ?? this.options.url ?? "wss://gateway.discord.gg"; const url=new URL(base); url.searchParams.set("v","10"); url.searchParams.set("encoding","json"); try { const ws=new WebSocket(url); this.socket=ws; ws.addEventListener("open",()=>{this.connecting=false;}); ws.addEventListener("message",event=>this.handleMessage(String(event.data))); ws.addEventListener("error",()=>this.emit("error",new Error("Gateway WebSocket error"))); ws.addEventListener("close",event=>this.handleClose(event.code,event.reason)); } catch(error) { this.connecting=false; this.emit("error",error instanceof Error?error:new Error(String(error))); this.scheduleReconnect(); } }
+  send(op:number,d?:unknown):void { if(this.socket?.readyState!==WebSocket.OPEN) throw new Error("Gateway is not connected"); this.socket.send(JSON.stringify({op,d})); }
+  updateVoiceState(guildId:string,channelId:string|null,selfMute=false,selfDeaf=false):void { this.send(OP.VOICE_STATE,{guild_id:guildId,channel_id:channelId,self_mute:selfMute,self_deaf:selfDeaf}); }
+  destroy():void { this.destroyed=true; this.stopHeartbeat(); if(this.reconnectTimer) clearTimeout(this.reconnectTimer); this.socket?.close(1000,"Client destroyed"); this.socket=undefined; }
+  private handleMessage(raw:string):void { let packet:GatewayPayload; try { packet=JSON.parse(raw) as GatewayPayload; } catch { this.emit("error",new Error("Invalid Gateway JSON payload")); return; }
+    if(packet.s!==undefined && packet.s!==null) this.sequence=packet.s;
+    switch(packet.op){ case OP.HELLO: { const d=packet.d as {heartbeat_interval:number}; this.startHeartbeat(d.heartbeat_interval); if(this.sessionId && this.sequence!==null) this.resume(); else this.identify(); break; }
+      case OP.HEARTBEAT_ACK: this.heartbeatAck=true; if(this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout); this.emit("heartbeat",{latency:Date.now()-this.lastHeartbeat}); break;
+      case OP.HEARTBEAT: this.heartbeat(); break;
+      case OP.DISPATCH: { const name=packet.t??""; const data=packet.d; if(name==="READY"){const ready=data as {session_id:string;resume_gateway_url?:string}; this.sessionId=ready.session_id; this.resumeUrl=ready.resume_gateway_url; this.attempts=0; this.emit("ready",data);} if(name==="RESUMED") this.attempts=0; this.emit("dispatch",{t:name,d:data,s:packet.s??null}); break; }
+      case OP.RECONNECT: this.socket?.close(4000,"Server requested reconnect"); break;
+      case OP.INVALID_SESSION: { const resumable=Boolean(packet.d); if(!resumable) this.clearSession(); setTimeout(()=>resumable?this.resume():this.identify(),Math.floor(1000+Math.random()*4000)); break; }
+    }
+  }
+  private identify():void { this.send(OP.IDENTIFY,{token:this.options.token,intents:this.options.intents,properties:{os:this.options.properties?.os??"linux",browser:this.options.properties?.browser??"discordnt.js",device:this.options.properties?.device??"discordnt.js"}}); }
+  private resume():void { this.send(OP.RESUME,{token:this.options.token,session_id:this.sessionId,seq:this.sequence}); }
+  private startHeartbeat(interval:number):void { this.stopHeartbeat(); this.heartbeatIntervalMs=interval; this.heartbeatAck=true; const first=Math.floor(Math.random()*interval); this.heartbeatInitial=setTimeout(()=>{this.heartbeat();this.heartbeatInterval=setInterval(()=>this.heartbeat(),interval);},first); }
+  private heartbeat():void { if(!this.heartbeatAck){this.socket?.close(4000,"Heartbeat ACK timeout");return;} this.heartbeatAck=false; this.lastHeartbeat=Date.now(); try{this.send(OP.HEARTBEAT,this.sequence);}catch{this.socket?.close();} if(this.heartbeatTimeout) clearTimeout(this.heartbeatTimeout); this.heartbeatTimeout=setTimeout(()=>{if(!this.heartbeatAck)this.socket?.close(4000,"Heartbeat ACK timeout");},this.heartbeatIntervalMs); }
+  private stopHeartbeat():void { if(this.heartbeatInterval)clearInterval(this.heartbeatInterval);if(this.heartbeatInitial)clearTimeout(this.heartbeatInitial);if(this.heartbeatTimeout)clearTimeout(this.heartbeatTimeout);this.heartbeatInterval=undefined;this.heartbeatInitial=undefined;this.heartbeatTimeout=undefined; }
+  private handleClose(code:number,reason:string):void { this.stopHeartbeat();this.connecting=false;this.socket=undefined;this.emit("close",{code,reason}); if([4004,4010,4011,4012,4013,4014].includes(code)){this.emit("error",new Error(`Fatal Discord Gateway close code: ${code}`));return;} if(code===4007||code===4009)this.clearSession(); if(!this.destroyed && this.options.reconnect!==false)this.scheduleReconnect(); }
+  private clearSession():void {this.sessionId=undefined;this.resumeUrl=undefined;this.sequence=null;}
+  private scheduleReconnect():void {if(this.destroyed||this.reconnectTimer)return;const attempt=++this.attempts;const delay=Math.min(1000*2**Math.min(attempt-1,6),60_000)+Math.floor(Math.random()*1000);this.emit("reconnecting",{attempt,delay});this.reconnectTimer=setTimeout(()=>{this.reconnectTimer=undefined;this.connect();},delay);}
+}
