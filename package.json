@@ -5,6 +5,10 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "repository": {
+  "type": "git",
+  "url": "https://github.com/amir10101-ctrl/discordnt-js.git"
+}
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
